@@ -37,10 +37,9 @@ The BSToken contract is the foundational ERC-20 token for the Bullish Social eco
 ### BSReward
 - `addWeekData`: Initialize a new week with Merkle root.
 - `useSnapshot`: Claim rewards using Merkle-validated snapshots.
-- `calculateRewardPiece`: Compute reward allocation based on rank and performance.
 
 ### BSToken
-- `initialize`: Distribute tokens to specified addresses during contract deployment.
+- `initialize`: Initialize token distribution
 - `setTrustedAddress`: Set or unset a trusted address (governor only).
 
 ## Security
