@@ -4,16 +4,22 @@ pragma solidity ^0.8.20;
 import { ERC20 } from "@openzeppelin/contracts/token/ERC20/ERC20.sol";
 import { ERC20Burnable } from "@openzeppelin/contracts/token/ERC20/extensions/ERC20Burnable.sol";
 import { VestingWallet } from "@openzeppelin/contracts/finance/VestingWallet.sol";
+import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
+import "@openzeppelin/contracts/access/Ownable.sol";
 import "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
 import "@openzeppelin/contracts/utils/cryptography/MerkleProof.sol";
 
 /**
- * @title Token contract for the bullish social ecosystem
+ * @title ERC20 Token contract for the Bullish Social ecosystem
  * @author ckmancho
- * - Official Website: https://bullish.social
- * - Official X: https://x.com/bullishsocial
+ * 
+ * Official Links:
+ * - Website: https://bullish.social
+ * - Twitter: https://x.com/bullishsocial 
+ * - Documentation: https://docs.bullish.social
  */
-contract BSToken is ERC20, ERC20Burnable, ReentrancyGuard {
+contract BSToken is ERC20, ERC20Burnable, ReentrancyGuard, Ownable {
+    using SafeERC20 for IERC20;
 
     //Supply
     uint256 constant private MAX_SUPPLY = 256000000 * 1e18;
@@ -22,14 +28,13 @@ contract BSToken is ERC20, ERC20Burnable, ReentrancyGuard {
     //Initial supply distribution
     uint8 constant private REWARD_PERCENTAGE = 50;
     uint8 constant private LIQUIDITY_PERCENTAGE = 15;
-    uint8 constant private TREASURY_PERCENTAGE = 5;
     uint8 constant private TEAM_PERCENTAGE = 15;
     uint8 constant private MARKETING_PERCENTAGE = 10;
+    uint8 constant private TREASURY_PERCENTAGE = 5;
     uint8 constant private PARTNERS_PERCENTAGE = 3;
-    uint8 constant private AFFILIATE_PERCENTAGE = 2;
+    uint8 constant private AFFILIATE_ACTIVITY_PERCENTAGE = 2;
 
     //Data
-    address immutable private i_signer;
     uint64 immutable private i_initialTimestamp;
     address private s_governorAddress;
     address private s_rewarderAddress;
@@ -43,17 +48,11 @@ contract BSToken is ERC20, ERC20Burnable, ReentrancyGuard {
     event VestingWalletSet(address indexed target, address indexed beneficiary, uint256 indexed amount, uint64 startTimestamp, uint64 durationSeconds);
 
     /* ERRORS */
-    error BS__OnlySignerAllowed(address signer);
     error BS__OnlyRewarderAllowed(address rewarderContractAddress);
     error BS__OnlyGovernorAllowed(address governorContractAddress);
     error BS__InsufficientBalance(uint256 balance, uint256 missingAmount);
 
     /* MODIFIERS */
-    modifier onlySigner() {
-        if (msg.sender != i_signer) revert BS__OnlySignerAllowed(i_signer);
-        _;
-    }
-
     modifier onlyGovernor() {
         if (msg.sender != s_governorAddress) revert BS__OnlyGovernorAllowed(s_governorAddress);
         _;
@@ -67,20 +66,16 @@ contract BSToken is ERC20, ERC20Burnable, ReentrancyGuard {
         - Marketing: %10
         - Treasury: %5
         - Partners: %3
-        - Affiliate: %2
+        - Affiliate & Activity Rewards: %2
     */
-    constructor () ERC20("BS", "BSTEST") {
-        //Set immutable data
-        i_signer = msg.sender;
+    constructor () ERC20("Bullish Social", "BUSO") Ownable(msg.sender) {
         i_initialTimestamp = uint64(block.timestamp);
-
-        //Set trusted address
         s_trustedAddresses[address(this)] = true;
     }
 
     /**
      * @notice Initializes the contract by distributing tokens to specified addresses.
-     * @dev This function can only be called once by the signer.
+     * @dev This function can only be called once by the owner.
      */
     function initialize(
         address governorAddress,
@@ -88,16 +83,16 @@ contract BSToken is ERC20, ERC20Burnable, ReentrancyGuard {
         address teamMembersAddress,
         address marketingAddress,
         address partnersAddress
-    ) external onlySigner nonReentrant {
+    ) external onlyOwner nonReentrant {
         address zero = address(0);
-        require(!s_initialized, "BS__AlreadyInitialized");
+        require(!s_initialized, "Already initialized");
         require(
             governorAddress != zero &&
             rewarderAddress != zero &&
             teamMembersAddress != zero &&
             marketingAddress != zero &&
             partnersAddress != zero,
-            "BS__InvalidAddress"
+            "Invalid address"
         );
 
         s_initialized = true;
@@ -112,13 +107,13 @@ contract BSToken is ERC20, ERC20Burnable, ReentrancyGuard {
             //Liquidity & Fair launch (%15)
             mint(msg.sender, _calculateSupply(LIQUIDITY_PERCENTAGE));
             
-            //Governor | Treasury (%5), Affiliate (%2)
+            //Governor Treasury (%5), Initial Affiliate and Activity will be stored in treasury (%2)
             mint(governorAddress, _calculateSupply(TREASURY_PERCENTAGE));
-            mint(governorAddress, _calculateSupply(AFFILIATE_PERCENTAGE));
+            mint(governorAddress, _calculateSupply(AFFILIATE_ACTIVITY_PERCENTAGE));
 
             //Vesting (Team members %15, Marketing %10, Partners %3)
-            _setVesting(teamMembersAddress, _calculateSupply(TEAM_PERCENTAGE), i_initialTimestamp + 180 days, 545 days);
-            _setVesting(marketingAddress, _calculateSupply(MARKETING_PERCENTAGE), i_initialTimestamp, 365 days);
+            _setVesting(teamMembersAddress, _calculateSupply(TEAM_PERCENTAGE), i_initialTimestamp + 180 days, 365 days);
+            _setVesting(marketingAddress, _calculateSupply(MARKETING_PERCENTAGE), i_initialTimestamp, 545 days);
             _setVesting(partnersAddress, _calculateSupply(PARTNERS_PERCENTAGE), i_initialTimestamp + 180, 545 days);
         }
 
@@ -164,6 +159,27 @@ contract BSToken is ERC20, ERC20Burnable, ReentrancyGuard {
 
         s_rewarderAddress = addr;
         _setTrustedAddress(addr, true);
+    }
+
+    /**
+     * @notice Allows the governor to recover any ERC20 tokens or ETH sent to this contract by mistake.
+     * @dev Only callable by the governor.
+     * @param tokenAddress Address of the ERC20 token to recover (use address(0) for ETH).
+     */
+    function recoverStuckTokens(address tokenAddress) public onlyGovernor nonReentrant {
+        require(s_governorAddress != address(0), "Governor address is not set");
+
+        // Is the token address zero? If so, we will transfer ETH.
+        if (tokenAddress == address(0)) {
+            // Transfer ETH to the governor address.
+            (bool success, ) = s_governorAddress.call{value: address(this).balance}("");
+            require(success, "ETH transfer failed");
+        } else {
+            // Transfer the specified ERC20 token to the treasury.
+            IERC20 token = IERC20(tokenAddress);
+            uint256 balance = token.balanceOf(address(this));
+            token.safeTransfer(s_governorAddress, balance);
+        }
     }
 
     function maxSupply() public pure returns(uint256) {

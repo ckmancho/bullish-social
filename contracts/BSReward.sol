@@ -57,43 +57,58 @@ contract BSReward is ReentrancyGuard {
         uint8 rewardLevel;
         
         /// @notice Maximum number of users eligible for individual rewards (5-10000)
-        uint64 rewardIndividualMax;
+        uint32 rewardIndividualMax;
         
         /// @notice Maximum number of clubs eligible for club rewards (10-100000)
-        uint64 rewardClubMax;
+        uint32 rewardClubMax;
         
         /// @notice Percentage of rewards allocated to individual users, rest for club rewards (1-30)
         uint8 rewardToIndividualPercent;
 
+        /// @notice Percentage of score weight in the individual reward calculation (0-100). Rest of the percent is for rank weight.
+        uint8 individualScoreWeight;
+
+        /// @notice Percentage of score weight in the club reward calculation (0-100). Rest of the percent is for rank weight.
+        uint8 clubScoreWeight;
+
         /// @notice Maximum number of members allowed per club (100-1000)
-        uint64 maxClubMembers;
+        uint32 maxClubMembers;
 
         /// @notice Allows others to claim rewards for snapshot owners
         bool allowClaimsForOthers;
     }
 
+    struct RewardPool {
+        uint256 totalRewardAmount;          // Total reward amount for the pool
+        uint256 remainingRewardAmount;      // Remaining reward amount in the pool
+        uint256 rankRewardPiece;            // Rank reward piece for the pool
+        uint256 scoreRewardPiece;           // Score reward piece for the pool
+        uint256 totalScores;                // Total scores for the pool (used for score-based calculations)
+        uint8 scoreWeight;                  // Weight of score in the reward calculation (0-100%) rest is for rank weight
+    }
+
+    struct WeeklyRewardData {
+        uint8 rewardLevel;                  // Reward Level
+        uint8 rewardToIndividualPercent;    // Percentage of rewards allocated to individual users (rest is going to club rewards)
+        RewardPool ipool;                   // Individual reward pool data
+        RewardPool cpool;                   // Club reward pool data
+    }
+
     /// @notice Weekly reward data structure
     struct WeekData {
         uint64  id;                         // Week ID
-        uint64  nonce;                      // Week Nonce
+        uint32  nonce;                      // Week Nonce
         uint256 date;                       // Start timestamp
         Status  status;                     // Current Status (NOT_EXIST, ONGOING, EXPIRED)
 
         bytes32 root;                       // MerkleTree Root Hash for snapshots
-
-        uint8   rewardLevel;                // Reward Level
-        uint8   rewardToIndividualPercent;  // Percentage of rewards allocated to individual users (rest is going to club rewards)
         
-        uint256 individualRewardPool;       // Remaining Reward Pool for individual rewards
-        uint256 clubRewardPool;             // Remaining Reward Pool for club rewards
-        
-        uint64  totalNumberOfSnapshot;      // Total number of snapshots
-        uint64  totalNumberOfIndividualEntries; // Total number of individual entries in the leaderboard
-        uint64  totalNumberOfClubEntries;   // Total number of club entries in the leaderboard
-        uint64  maxClubMembers;             // Maximum number of members allowed per club
+        uint32  totalNumberOfSnapshot;      // Total number of snapshots
+        uint32  totalNumberOfIndividualEntries; // Total number of individual entries in the leaderboard
+        uint32  totalNumberOfClubEntries;   // Total number of club entries in the leaderboard
+        uint32  maxClubMembers;             // Maximum number of members allowed per club
 
-        uint256 individualRewardPiece;      // Reward piece for individual reward
-        uint256 clubRewardPiece;            // Reward piece for clubs
+        WeeklyRewardData rewardData;        // Reward data for the week
     }
 
     /// @notice Represents a snapshot of user data for reward claims.
@@ -117,9 +132,10 @@ contract BSReward is ReentrancyGuard {
         uint64 id;
         uint64 score;
         uint64 rank;
-        uint64 distributionMethod;
+        uint8 distributionMethod;
         uint64 memberCount;
         uint64 memberRank;
+        uint64 memberScore;
     }
 
     /// @notice Structure to store used individual ranks for each week.
@@ -138,7 +154,9 @@ contract BSReward is ReentrancyGuard {
     /// @notice Represents the club reward distribution method.
     enum DistributionMethod {
         SHARED,
-        PERFORMANCE
+        RANK_BASED,
+        SCORE_BASED,
+        BALANCED
     }
 
     /* ERRORS */
@@ -147,7 +165,7 @@ contract BSReward is ReentrancyGuard {
 
     /* EVENTS */
     event WeekDataAdded(uint256 indexed weekId, uint256 indexed date, uint256 indexed totalRewardAmount);
-    event SnapshotUsed(address indexed forAddress, Snapshot indexed snapshot, uint256 indexed weekId, uint256 individualReward, uint256 clubReward);
+    event SnapshotUsed(address indexed forAddress, uint256 indexed weekId, uint256 individualReward, uint256 clubReward);
     event IndividualRankUsed(uint256 indexed weekId, address indexed user, uint64 score, uint64 indexed rank, uint256 reward);
     event ClubMemberRankUsed(uint256 indexed weekId, address indexed user, uint64 clubId, uint64 indexed clubRank, uint64 clubScore, uint64 memberRank, uint256 reward);
     event ERC20Transferred(address indexed erc20, address indexed to, uint256 indexed amount);
@@ -159,6 +177,8 @@ contract BSReward is ReentrancyGuard {
     event MaxIndividualsSet(uint64 indexed previous, uint64 indexed newValue);
     event MaxClubsSet(uint64 indexed previous, uint64 indexed newValue);
     event RewardToIndividualPercentSet(uint8 indexed previous, uint8 indexed newValue);
+    event IndividualScoreWeightSet(uint8 indexed previous, uint8 indexed newValue);
+    event ClubScoreWeightSet(uint8 indexed previous, uint8 indexed newValue);
     event MaxClubMembersSet(uint64 indexed previous, uint64 indexed newValue);
     event BannedUserSet(address indexed user, bool indexed isBanned);
     event BannedClubSet(uint64 indexed clubId, bool indexed isBanned);
@@ -182,15 +202,17 @@ contract BSReward is ReentrancyGuard {
     }
 
     /* CONSTRUCTOR */
-    constructor(address tokenAddress, uint64 initialMaxIndividualRank, uint64 initialMaxClubRank) {
+    constructor(address tokenAddress, uint32 initialMaxIndividualRank, uint32 initialMaxClubRank) {
         i_signer = msg.sender;
         i_token = BSTokenInterface(tokenAddress);
 
         //Set config
-        s_config.rewardLevel = 1;
+        s_config.rewardLevel = 1; //test:1
         s_config.rewardIndividualMax = initialMaxIndividualRank;
         s_config.rewardClubMax = initialMaxClubRank;
         s_config.rewardToIndividualPercent = 25;
+        s_config.individualScoreWeight = 50; //test:50
+        s_config.clubScoreWeight = 65; //test:65
         s_config.maxClubMembers = 100;
         s_config.allowClaimsForOthers = false;
 
@@ -207,13 +229,17 @@ contract BSReward is ReentrancyGuard {
      * @param totalNumberOfSnapshot The total number of snapshots for the week.
      * @param totalNumberOfIndividualEntries The total number of individual entries for the week.
      * @param totalNumberOfClubEntries The total number of club entries for the week.
+     * @param totalIndividualScores The total individual scores for the week.
+     * @param totalClubScores The total club scores for the week.
      * @param root The Merkle tree root hash for the week's snapshots.
      */
     function addWeekData(
-        uint64 nonce,
-        uint64 totalNumberOfSnapshot,
-        uint64 totalNumberOfIndividualEntries,
-        uint64 totalNumberOfClubEntries,
+        uint32 nonce,
+        uint32 totalNumberOfSnapshot,
+        uint32 totalNumberOfIndividualEntries,
+        uint32 totalNumberOfClubEntries,
+        uint32 totalIndividualScores,
+        uint32 totalClubScores,
         bytes32 root
     ) external onlySigner {
         uint256 lastWeekDate = getLastWeekDate();
@@ -224,6 +250,9 @@ contract BSReward is ReentrancyGuard {
 
         // Ensure there is at least one snapshot
         require(totalNumberOfSnapshot > 0, "BSReward__NotEnoughSnapshots");
+
+        // Validate total number of individual scores
+        require(totalIndividualScores > 0, "BSReward__InvalidIndividualScores");
 
         // Validate nonce
         require(nonce >= 100000000 && nonce <= 999999999, "BSReward__InvalidNonce");
@@ -242,36 +271,28 @@ contract BSReward is ReentrancyGuard {
         require(totalNumberOfIndividualEntries <= s_config.rewardIndividualMax, "BSReward__MaxIndividualRanksExceeds");
         require(totalNumberOfClubEntries <= s_config.rewardClubMax, "BSReward__MaxClubRankExceeds");
 
-        // Calculate individual and club reward pools
-        uint256 individualRewardPool = (totalRewardAmount * s_config.rewardToIndividualPercent) / 100;
-        uint256 individualRewardPiece = 0;
-        if (totalNumberOfIndividualEntries > 0) {
-            individualRewardPiece = calculateRewardPiece(totalNumberOfIndividualEntries, individualRewardPool);
-        }
-
-        uint256 clubRewardPool = totalNumberOfClubEntries == 0 ? 0 : totalRewardAmount - individualRewardPool;
-        uint256 clubRewardPiece = 0;
-        if (totalNumberOfClubEntries > 0) {
-            clubRewardPiece = calculateRewardPiece(totalNumberOfClubEntries, clubRewardPool);
-        }
+        // Weights
+        WeeklyRewardData memory rewardData = _calculateWeeklyRewardData(
+            totalRewardAmount,
+            totalNumberOfIndividualEntries,
+            totalNumberOfClubEntries,
+            totalIndividualScores,
+            totalClubScores
+        );
 
         // Create week data
-        WeekData memory data;
-        data.id = uint64(s_weekData.length);
-        data.nonce = nonce;
-        data.date = nextWeekDate;
-        data.root = root;
-        data.status = Status.ONGOING;
-        data.rewardLevel = s_config.rewardLevel;
-        data.rewardToIndividualPercent = s_config.rewardToIndividualPercent;
-        data.totalNumberOfSnapshot = totalNumberOfSnapshot;
-        data.totalNumberOfIndividualEntries = totalNumberOfIndividualEntries;
-        data.totalNumberOfClubEntries = totalNumberOfClubEntries;
-        data.maxClubMembers = s_config.maxClubMembers;
-        data.individualRewardPool = individualRewardPool;
-        data.clubRewardPool = clubRewardPool;
-        data.individualRewardPiece = individualRewardPiece;
-        data.clubRewardPiece = clubRewardPiece;
+        WeekData memory data = WeekData({
+            id: uint64(s_weekData.length),
+            nonce: nonce,
+            date: nextWeekDate,
+            status: Status.ONGOING,
+            root: root,
+            totalNumberOfSnapshot: totalNumberOfSnapshot,
+            totalNumberOfIndividualEntries: totalNumberOfIndividualEntries,
+            totalNumberOfClubEntries: totalNumberOfClubEntries,
+            maxClubMembers: s_config.maxClubMembers,
+            rewardData: rewardData
+        });
 
         s_weekData.push(data);
         emit WeekDataAdded(s_weekData.length - 1, data.date, totalRewardAmount);
@@ -281,6 +302,60 @@ contract BSReward is ReentrancyGuard {
             uint256 expiredWeekId = s_weekData.length - 9;
             s_weekData[expiredWeekId].status = Status.EXPIRED;
         }
+    }
+
+    function _calculateWeeklyRewardData(
+        uint256 totalRewardAmount,
+        uint32 totalNumberOfIndividualEntries,
+        uint32 totalNumberOfClubEntries,
+        uint32 totalIndividualScores,
+        uint32 totalClubScores
+    ) internal view returns (WeeklyRewardData memory) {
+        // Calculate Individual reward pool and reward pieces
+        uint256 individualRewardPool = (totalRewardAmount * s_config.rewardToIndividualPercent) / 100;
+        uint256 individualRankRewardPiece = 0;
+        uint256 individualScoreRewardPiece = 0;
+        if (totalNumberOfIndividualEntries > 0) {
+            uint8 scoreWeight = s_config.individualScoreWeight;
+            uint8 rankWeight = 100 - scoreWeight;
+
+            individualRankRewardPiece = calculateRankRewardPiece(totalNumberOfIndividualEntries, individualRewardPool, rankWeight);
+            individualScoreRewardPiece = calculateScoreRewardPiece(totalIndividualScores, individualRewardPool, scoreWeight);
+        }
+
+        // Calculate Club reward pool and reward pieces
+        uint256 clubRewardPool = totalNumberOfClubEntries == 0 ? 0 : totalRewardAmount - individualRewardPool;
+        uint256 clubRankRewardPiece = 0;
+        uint256 clubScoreRewardPiece = 0;
+        if (totalNumberOfClubEntries > 0 && totalClubScores > 0) {
+            uint8 scoreWeight = s_config.clubScoreWeight;
+            uint8 rankWeight = 100 - scoreWeight;
+
+            clubRankRewardPiece = calculateRankRewardPiece(totalNumberOfClubEntries, clubRewardPool, rankWeight);
+            clubScoreRewardPiece = calculateScoreRewardPiece(totalClubScores, clubRewardPool, scoreWeight);
+        }
+
+        // Create and return the WeeklyRewardData structure
+        return WeeklyRewardData({
+            rewardLevel: s_config.rewardLevel,
+            rewardToIndividualPercent: s_config.rewardToIndividualPercent,
+            ipool: RewardPool({
+                totalRewardAmount: individualRewardPool,
+                remainingRewardAmount: individualRewardPool,
+                rankRewardPiece: individualRankRewardPiece,
+                scoreRewardPiece: individualScoreRewardPiece,
+                scoreWeight: s_config.individualScoreWeight,
+                totalScores: totalIndividualScores
+            }),
+            cpool: RewardPool({
+                totalRewardAmount: clubRewardPool,
+                remainingRewardAmount: clubRewardPool,
+                rankRewardPiece: clubRankRewardPiece,
+                scoreRewardPiece: clubScoreRewardPiece,
+                scoreWeight: s_config.clubScoreWeight,
+                totalScores: totalClubScores
+            })
+        });
     }
 
     /**
@@ -295,6 +370,7 @@ contract BSReward is ReentrancyGuard {
     ) external nonReentrant {
         // Verify and get Week Data
         WeekData memory data = _verifyWeekData(snapshot);
+        WeeklyRewardData memory rewardData = data.rewardData;
         
         // Verify and get Snapshot Hash
         bytes32 snapshotHash = _verifySnapshot(snapshot, proof, data);
@@ -311,13 +387,13 @@ contract BSReward is ReentrancyGuard {
 
         // Reduce from reward pool
         if (individualReward > 0) {
-            require(data.individualRewardPool >= individualReward, "BSReward__RewardPoolExceeds");
-            s_weekData[snapshot.weekIndex].individualRewardPool -= individualReward;
+            require(rewardData.ipool.remainingRewardAmount >= individualReward, "BSReward__RewardPoolExceeds");
+            s_weekData[snapshot.weekIndex].rewardData.ipool.remainingRewardAmount -= individualReward;
         }
 
         if (clubReward > 0) {
-            require(data.clubRewardPool >= clubReward, "BSReward__ClubRewardPoolExceeds");
-            s_weekData[snapshot.weekIndex].clubRewardPool -= clubReward;
+            require(rewardData.cpool.remainingRewardAmount >= clubReward, "BSReward__ClubRewardPoolExceeds");
+            s_weekData[snapshot.weekIndex].rewardData.cpool.remainingRewardAmount -= clubReward;
         }
 
         // Check remaining reward supply
@@ -328,7 +404,7 @@ contract BSReward is ReentrancyGuard {
         // Transfer reward
         IERC20(i_token).safeTransfer(snapshot.user, totalRewardAmount);
 
-        emit SnapshotUsed(snapshot.user, snapshot, snapshot.weekIndex, individualReward, clubReward);
+        emit SnapshotUsed(snapshot.user, snapshot.weekIndex, individualReward, clubReward);
     }
 
     /**
@@ -409,7 +485,7 @@ contract BSReward is ReentrancyGuard {
      * @dev Only callable by DAO. Affects future weeks.
      * @param newValue New maximum (5-10000)
      */
-    function setMaxIndividualUsersToReward(uint64 newValue) external onlyDAO {
+    function setMaxIndividualUsersToReward(uint32 newValue) external onlyDAO {
         require(newValue >= 5 && newValue <= 10000, "Max individual users to reward must be between 5 and 10000");
 
         emit MaxIndividualsSet(s_config.rewardIndividualMax, newValue);
@@ -421,7 +497,7 @@ contract BSReward is ReentrancyGuard {
      * @dev Only callable by the DAO. Affects future weeks' reward distribution.
      * @param newValue The new maximum number of clubs (10-100000).
      */
-    function setMaxClubsToReward(uint64 newValue) external onlyDAO {
+    function setMaxClubsToReward(uint32 newValue) external onlyDAO {
         require(newValue >= 10 && newValue <= 100000, "Max clubs to reward must be between 10 and 100000");
 
         emit MaxClubsSet(s_config.rewardClubMax, newValue);
@@ -441,12 +517,36 @@ contract BSReward is ReentrancyGuard {
     }
 
     /**
+     * @notice Sets the percentage of club score weight in the reward calculation.
+     * @dev Only callable by the DAO. The remaining percentage is allocated to rank weight. Affects future weeks.
+     * @param newValue The new percentage value (0-100).
+     */
+    function setClubRewardScoreWeight(uint8 newValue) external onlyDAO {
+        require(newValue >= 0 && newValue <= 100, "Reward score weight must be between 0 and 100");
+
+        emit ClubScoreWeightSet(s_config.clubScoreWeight, newValue);
+        s_config.clubScoreWeight = newValue;
+    }
+
+    /**
+     * @notice Sets the percentage of individual score weight in the reward calculation.
+     * @dev Only callable by the DAO. The remaining percentage is allocated to rank weight. Affects future weeks.
+     * @param newValue The new percentage value (0-100).
+     */
+    function setIndividualRewardScoreWeight(uint8 newValue) external onlyDAO {
+        require(newValue >= 0 && newValue <= 100, "Reward score weight must be between 0 and 100");
+
+        emit IndividualScoreWeightSet(s_config.individualScoreWeight, newValue);
+        s_config.individualScoreWeight = newValue;
+    }
+
+    /**
      * @notice Sets the maximum number of members allowed per club.
      * @dev Only callable by the DAO. Affects club reward distribution calculations.
      * @param newValue The new maximum number of members (100-1000).
      * @dev Reverts if the new value is outside the allowed range.
      */
-    function setMaxClubMembers(uint64 newValue) external onlyDAO {
+    function setMaxClubMembers(uint32 newValue) external onlyDAO {
         require(newValue >= 100 && newValue <= 1000, "Max club members must be between 100 and 1000");
 
         emit MaxClubMembersSet(s_config.maxClubMembers, newValue);
@@ -602,52 +702,96 @@ contract BSReward is ReentrancyGuard {
         // Snapshot - calculate individual reward
         WeekData memory data = s_weekData[snapshot.weekIndex];
         if (snapshot.individual.rank > 0 && snapshot.individual.rank <= data.totalNumberOfIndividualEntries) {
-            individualReward = calculateReward(data.totalNumberOfIndividualEntries, snapshot.individual.rank, data.individualRewardPiece);
+            // Check if the numbers are valid
+            require(snapshot.individual.score <= data.rewardData.ipool.totalScores, "BSReward__InvalidIndividualScore");
+
+            // Reward distribution is balanced between rank and score
+            uint256 rankReward = calculateRankReward(data.totalNumberOfIndividualEntries, snapshot.individual.rank, data.rewardData.ipool.rankRewardPiece);
+            uint256 scoreReward = calculateScoreReward(snapshot.individual.score, data.rewardData.ipool.scoreRewardPiece);
+            individualReward = rankReward + scoreReward;
         }
     }
 
     /**
      * @notice Calculates the club member reward for a user's snapshot.
      * @dev This function checks various conditions to ensure the club is eligible for rewards.
-     *      It verifies the club's rank, member count, member rank, and distribution method.
-     *      If the club is banned, it returns 0 as the reward.
+     *      It verifies the club's rank, club's score, member count, member rank, and distribution method.
+     *      If the club is banned, it returns 0 as the reward, not reverts an error.
+     *      That means individual users can still claim their individual rewards.
      *      Otherwise, it calculates the total reward amount for the club and distributes it
      *      based on the specified distribution method (shared or performance-based).
      * @param snapshot The user's snapshot data.
-     * @return clubReward The calculated reward amount.
+     * @return clubMemberReward The calculated reward amount for club member.
      */
-    function calculateClubMemberReward(Snapshot memory snapshot) requiresWeekData(snapshot.weekIndex) public view returns(uint256 clubReward) {
+    function calculateClubMemberReward(Snapshot memory snapshot) requiresWeekData(snapshot.weekIndex) public view returns(uint256 clubMemberReward) {
         WeekData memory data = s_weekData[snapshot.weekIndex];
 
         //Club Snapshot - calculate reward
         ClubData memory club = snapshot.club;
 
-        //If user has club and the club is eligible for rewards
-        if (club.rank > 0 && club.rank <= data.totalNumberOfClubEntries) {
+        //If user has club and the club is eligible for rewards.
+        //Club rank should be between 1 and total number of club entries
+        //Club score should be greater than 0, if not, it means the club is not eligible for rewards
+        if (club.rank > 0 && club.rank <= data.totalNumberOfClubEntries && club.score > 0) {
             //Check if the numbers are valid
             require(club.memberCount > 0, "BSReward__InvalidMemberCount");
             require(club.memberCount <= data.maxClubMembers, "BSReward__MaxMembersExceeds");
             require(club.memberRank > 0, "BSReward__InvalidMemberRank");
             require(club.memberRank <= data.maxClubMembers, "BSReward__MaxClubMemberRankExceeds");
             require(club.memberRank <= club.memberCount, "BSReward__MaxMemberRankReached");
-            require(club.distributionMethod <= 1, "BSReward__InvalidClubDistributionMethod");
+            require(club.distributionMethod <= 3, "BSReward__InvalidClubDistributionMethod");
+            require(club.score <= data.rewardData.cpool.totalScores, "BSReward__InvalidClubScore");
+            require(club.memberScore <= club.score, "BSReward__InvalidMemberScore");
 
             //Check club is banned
             if (s_bannedClubs[snapshot.club.id]) {
-                return 0; //No club reward
+                return 0; //No club reward, not throwing error. Individual users can still claim their individual rewards
             }
 
             //Total reward amount for the club
-            uint256 rewardPoolForClub = calculateReward(data.totalNumberOfClubEntries, club.rank, data.clubRewardPiece);
-            if (club.distributionMethod == 0) {
-                //Shared distribution
-                clubReward = rewardPoolForClub / club.memberCount;
-            } else {
-                //Performance distribution
-                uint256 rewardPiece = calculateRewardPiece(club.memberCount, rewardPoolForClub);
-                clubReward = calculateReward(club.memberCount, club.memberRank, rewardPiece);
+            uint256 rewardPoolForClub = calculateClubReward(club.rank, club.score, snapshot.weekIndex);
+
+            //Calculate member's reward based on the distribution method
+            if (club.distributionMethod == uint8(DistributionMethod.SHARED)) {
+                // Reward distribution is shared among all members
+                clubMemberReward = rewardPoolForClub / club.memberCount;
+            } else if (club.distributionMethod == uint8(DistributionMethod.RANK_BASED)) {
+                // Reward distribution is based on rank
+                uint256 rewardPiece = calculateRankRewardPiece(club.memberCount, rewardPoolForClub, 100);
+                clubMemberReward = calculateRankReward(club.memberCount, club.memberRank, rewardPiece);
+            } else if (club.distributionMethod == uint8(DistributionMethod.SCORE_BASED)) {
+                // Reward distribution is based on score
+                uint256 scoreRewardPiece = calculateScoreRewardPiece(club.score, rewardPoolForClub, 100);
+                clubMemberReward = calculateScoreReward(club.memberScore, scoreRewardPiece);
+            } else if (club.distributionMethod == uint8(DistributionMethod.BALANCED)) {
+                // Reward distribution is balanced between rank and score
+                uint8 scoreWeight = data.rewardData.cpool.scoreWeight;
+                uint8 rankWeight = 100 - scoreWeight;
+
+                uint256 rankRewardPiece = calculateRankRewardPiece(club.memberCount, rewardPoolForClub, rankWeight);
+                uint256 scoreRewardPiece = calculateScoreRewardPiece(club.score, rewardPoolForClub, scoreWeight);
+                
+                uint256 rankReward = calculateRankReward(club.memberCount, club.memberRank, rankRewardPiece);
+                uint256 scoreReward = calculateScoreReward(club.memberScore, scoreRewardPiece);
+                clubMemberReward = rankReward + scoreReward;
             }
         }
+    }
+
+    /**
+     * @param clubRank The rank of the club.
+     * @dev Calculates the total reward amount for a club based on its rank and score.
+     * @param clubScore The score of the club.
+     * @param weekIndex Week Index for which the reward is being calculated.
+     * @return clubReward The total reward amount for the club.
+     */
+    function calculateClubReward(uint64 clubRank, uint64 clubScore, uint256 weekIndex) requiresWeekData(weekIndex) public view returns(uint256 clubReward) {
+        WeekData memory data = s_weekData[weekIndex];
+        
+        uint256 rewardPoolFromRank = calculateRankReward(data.totalNumberOfClubEntries, clubRank, data.rewardData.cpool.rankRewardPiece);
+        uint256 rewardPoolFromScore = calculateScoreReward(clubScore, data.rewardData.cpool.scoreRewardPiece);
+
+        clubReward = rewardPoolFromRank + rewardPoolFromScore;
     }
 
     /**
@@ -715,11 +859,11 @@ contract BSReward is ReentrancyGuard {
     }
 
     function getWeekRemainingClubPool(uint256 weekIndex) external view returns(uint256) {
-        return s_weekData[weekIndex].clubRewardPool;
+        return s_weekData[weekIndex].rewardData.cpool.remainingRewardAmount;
     }
 
     function getWeekRemainingIndividualPool(uint256 weekIndex) external view returns(uint256) {
-        return s_weekData[weekIndex].individualRewardPool;
+        return s_weekData[weekIndex].rewardData.ipool.remainingRewardAmount;
     }
 
     function getUsedSnapshotCount(uint64 weekIndex) external view returns(uint64) {
@@ -762,6 +906,14 @@ contract BSReward is ReentrancyGuard {
         return s_config.rewardIndividualMax;
     }
 
+    function getIndividualScoreWeightPercent() external view returns(uint8) {
+        return s_config.individualScoreWeight;
+    }
+
+    function getClubScoreWeightPercent() external view returns(uint8) {
+        return s_config.clubScoreWeight;
+    }
+
     function getWeekCount() external view returns(uint256) {
         return s_weekData.length;
     }
@@ -773,13 +925,25 @@ contract BSReward is ReentrancyGuard {
      * @param totalReward The total reward amount/pool.
      * @return The calculated reward piece.
      */
-    function calculateRewardPiece(uint64 receivers, uint256 totalReward) public pure returns(uint256) {
+    function calculateRankRewardPiece(uint64 receivers, uint256 totalReward, uint8 rankWeight) public pure returns(uint256) {
         //Calculate sum of ranks (∑) eg. 1+2+3+4...168+169+170
         uint256 totalRank = receivers * (receivers + 1) / 2;
 
         //Calculate reward piece
         uint256 rewardPiece = totalReward / totalRank; // for user rewards, use: individualRewardPiece * (totalUsers - rank + 1)
-        return rewardPiece;
+        return (rewardPiece * rankWeight) / 100; // Get percentage of the piece
+    }
+
+    /**
+     * @notice Calculates the reward piece for a specific score weight.
+     * @param totalScore The total score of all rankings.
+     * @param totalReward The total reward amount/pool.
+     * @param scoreWeightPercent The percentage of the score weight (0-100%)
+     * @return The calculated reward piece.
+     */
+    function calculateScoreRewardPiece(uint64 totalScore, uint256 totalReward, uint8 scoreWeightPercent) public pure returns(uint256) {
+        uint256 piece = totalReward / totalScore;
+        return (piece * scoreWeightPercent) / 100; // Get percentage of the piece
     }
 
     /**
@@ -789,8 +953,18 @@ contract BSReward is ReentrancyGuard {
      * @param rewardPiece The reward piece calculated for the receivers.
      * @return The calculated reward amount.
      */
-    function calculateReward(uint64 totalReceivers, uint64 rank, uint256 rewardPiece) public pure returns(uint256) {
+    function calculateRankReward(uint64 totalReceivers, uint64 rank, uint256 rewardPiece) public pure returns(uint256) {
         return rewardPiece * (totalReceivers - rank + 1);
+    }
+
+    /**
+     * @notice Calculates the reward for a specific score.
+     * @param score The score of the receiver.
+     * @param rewardPiece The reward piece calculated for the score.
+     * @return The calculated reward amount.
+     */
+    function calculateScoreReward(uint64 score, uint256 rewardPiece) public pure returns(uint256) {
+        return score * rewardPiece;
     }
 
     /**
@@ -817,7 +991,7 @@ contract BSReward is ReentrancyGuard {
     function encodeSnapshot(Snapshot memory s) public pure returns(bytes32) {
         bytes32 leaf = keccak256(bytes.concat(keccak256(abi.encode(
             s.id, s.weekIndex, s.weekNonce, s.user, s.individual.score, s.individual.rank,
-            s.club.id, s.club.score, s.club.rank, s.club.distributionMethod, s.club.memberCount, s.club.memberRank
+            s.club.id, s.club.score, s.club.rank, s.club.distributionMethod, s.club.memberCount, s.club.memberRank, s.club.memberScore
         ))));
         return leaf;
     }

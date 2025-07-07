@@ -6,20 +6,31 @@ import "./interfaces/BSRewardInterface.sol";
 import "./interfaces/BSTokenInterface.sol";
 
 /**
- * @title BSGovernor: On-Chain Governance and Proposal System
+ * @title BSGovernor: On-Chain Governance and Proposal System for Bullish Social
  * @author ckmancho
- * @notice Decentralized governance mechanism for protocol upgrades and parameter changes.
- * @dev Combines liquid democracy, time-locked executions, and DAO-controlled configurations.
+ * @notice Advanced decentralized governance mechanism for protocol upgrades, parameter changes and treasury management
+ * @dev Implements a governance system combining liquid democracy, time-locked executions, and configurable parameters
  *
  * Key Features:
- * - Proposal creation with voting power based on historical leaderboard performance
+ * - Proposal creation with weighted voting power based on historical individual and club leaderboard rankings
+ * - Dual voting power system combining individual achievements and club leadership positions
  * - Time-locked execution for security critical operations
- * - DAO-controlled governance parameters
- * - Anti-spam measures with proposal limits
- * - Interim governance mode for initial bootstrapping
+ * - Treasury management for protocol fees and asset distribution to ecosystem participants  
+ * - Configurable governance parameters controlled by DAO including quorum, approval thresholds and voting duration
+ * - Anti-spam protection with weekly proposal limits and duplicate proposal detection
+ * - Interim governance mode for initial protocol bootstrapping
+ * - Extensible function restriction system for protocol security
  *
- * - Official Website: https://bullish.social
- * - Official X: https://x.com/bullishsocial
+ * Security Features:
+ * - Reentrancy protection for execution functions
+ * - Timelock delays for critical operations
+ * - Trusted address restrictions for proposal targets (stored in BSToken contract, updated by DAO)
+ * - Vote power verification through proofs (verified by BSReward contract)
+ *
+ * Official Links:
+ * - Website: https://bullish.social
+ * - Twitter: https://x.com/bullishsocial 
+ * - Documentation: https://docs.bullish.social
  */
 contract BSGovernor is ReentrancyGuard {
     //Data
@@ -28,8 +39,8 @@ contract BSGovernor is ReentrancyGuard {
     BSRewardInterface immutable private i_rewarder;
 
     //Config
-    uint256 constant public TIMELOCK_DURATION = 1 days;
-    uint256 constant public EXECUTION_DURATION = 5 days;
+    uint256 constant public TIMELOCK_DURATION = 1 days; // 1 day after the votinig period ends
+    uint256 constant public EXECUTION_DURATION = 5 days; // 5 days after the voting period ends
     DAOConfig private s_config;
 
     //Proposals
@@ -45,13 +56,17 @@ contract BSGovernor is ReentrancyGuard {
     //WeekId -> User -> Proposal Counter (Max 4)
     mapping(uint64 => mapping(address => uint8)) private s_weeklyProposalCounter;
 
+    //WeekId -> ProposalHash -> bool (If proposal with this hash is already created in this week)
     mapping(uint64 => mapping(bytes32 => bool)) private s_weeklyProposalHashs;
+
+    //User Address -> ProposalId
+    mapping(address => uint64[]) private s_userProposals;
 
     /* STRUCTS */
 
     /// @notice Governance configuration parameters controlled by DAO
     struct DAOConfig {
-        /// @notice Minimum participation percentage (20-60)
+        /// @notice Minimum participation percentage (5-60)
         uint16 quorumThresholdPercent;
         
         /// @notice Minimum approval percentage (70-90)
@@ -66,6 +81,9 @@ contract BSGovernor is ReentrancyGuard {
 
         /// @notice Voting duration in seconds (3-14 days)
         uint64 votingDuration;
+
+        /// @notice Maximum number of executions per proposal (1-10)
+        uint16 maxExecutionsPerProposal;
         
         /// @notice Interim governance activation status
         bool interimActive;
@@ -91,9 +109,11 @@ contract BSGovernor is ReentrancyGuard {
     }
 
     struct Proposal {
+        string title;                       // Proposal title provided by the proposer
         uint64 id;                          // Proposal ID
-        uint64 yesVotes;                    // Accumulated yes votes
-        uint64 noVotes;                     // Accumulated no votes
+        uint64 yesVotes;                    // Accumulated yes vote power
+        uint64 noVotes;                     // Accumulated no vote power
+        uint64 totalVoters;                 // Total number of voters
         address proposer;                   // Proposal creator address
 
         // Initial
@@ -105,14 +125,20 @@ contract BSGovernor is ReentrancyGuard {
         uint64 approvalThresholdPercent;    // Minimum approval percentage required to approve the proposal
 
         // Execute data
+        ProposalExecution[] executions;     // List of execution calls
+
+        // State
+        bool ended;                         // Is proposal active?
+        ProposalOutcome outcome;            // Voting outcome
+        ProposalResult[] results;           // Execution result
+    }
+
+    /// @notice Proposal execution details
+    struct ProposalExecution {
         address target;                     // Target contract address to call
         bytes4 selector;                    // Function selector to call
         bytes args;                         // Encoded function arguments
-
-        // State
-        bool active;                        // Is proposal active?
-        ProposalOutcome outcome;            // Voting outcome
-        ProposalResult result;              // Execution result
+        uint256 value;                      // Ether value to send with the call
     }
 
     /// @notice Execution result details for proposals
@@ -144,20 +170,22 @@ contract BSGovernor is ReentrancyGuard {
         NO
     }
 
-    /* ERRORS */
+    /* CUSTOM ERRORS */
     error BS__OnlyDAOAllowed(address daoAddress);
     
     /* PROPOSAL EVENTS */
-    event ProposalCreated(uint64 indexed proposalId);
+    event ProposalCreated(uint64 indexed proposalId, address indexed proposer);
     event ProposalVoted(uint64 indexed proposalId, address indexed user, bool indexed decision, uint64 power);
     event ProposalFinalized(uint64 indexed proposalId, ProposalOutcome indexed outcome);
-    event ProposalExecuted(uint64 indexed proposalId, ProposalExecutionStatus indexed outcome, bytes callResult);
+    event ProposalExecuted(uint64 indexed proposalId, string title, address indexed executor, bool allSucceed);
+    event ProposalExpired(uint64 indexed proposalId, string title);
 
     /* DAO UPDATE EVENTS */
     event QuorumThresholdPercentUpdated(uint16 indexed oldValue, uint16 indexed newValue);
     event ApprovalThresholdPercentUpdated(uint16 indexed oldValue, uint16 indexed newValue);
     event EligibleWeekCountUpdated(uint16 indexed oldValue, uint16 indexed newValue);
     event VotingMaximumRankUpdated(uint16 indexed oldValue, uint16 indexed newValue);
+    event MaxExecutionsPerProposalUpdated(uint16 indexed oldValue, uint16 indexed newValue);
     event InterimStateUpdated(bool indexed isActive);
     event AllowOnlyTrustedTargetsUpdated(bool indexed isOn);
     event VotingDurationUpdated(uint64 indexed oldValue, uint64 indexed newValue);
@@ -177,53 +205,63 @@ contract BSGovernor is ReentrancyGuard {
     }
 
     modifier requiresProposal(uint64 proposalId) {
-        require(proposalId < s_proposals.length && s_proposals[proposalId].target != address(0), "Proposal with given ID does not exist");
+        require(proposalId < s_proposals.length && s_proposals[proposalId].proposer != address(0), "Proposal with given ID does not exist");
         _;
     }
 
     /* CONSTRUCTOR */
     constructor(address tokenAddress, address rewarderAddress) {
+        require(tokenAddress != address(0) && rewarderAddress != address(0), "Invalid token or rewarder address");
+
         i_token = BSTokenInterface(tokenAddress);
         i_rewarder = BSRewardInterface(rewarderAddress);
         i_interimOwner = msg.sender;
 
         s_config.interimActive = true;
         s_config.allowOnlyTrustedTargets = true;
-        s_config.quorumThresholdPercent = 60;        //At production: %33
+        s_config.quorumThresholdPercent = 60;        //Initial value at production: %33
         s_config.approvalThresholdPercent = 80;
         s_config.eligibleWeekCount = 2;
         s_config.votingMaximumRank = 100;
         s_config.votingDuration = 4 days;
+        s_config.maxExecutionsPerProposal = 5;
     }
 
     /**
      * @notice Creates a new proposal.
-     * @dev This function requires the caller to have sufficient power as determined by the `requiresPower` modifier.
-     * @param target The address of the target contract.
-     * @param selector The function selector to be called on the target contract.
-     * @param args The arguments to be passed to the function call on the target contract.
+     * @dev This function requires the caller to have sufficient power as determined by the {requiresPower} modifier.
+     * @param executions An array of ProposalExecution structs containing the details of each execution.
      * @param individualRankProofs An array of proofs for individual ranks to determine user's vote power.
      * @param clubRankProofs An array of proofs for club ranks to determine user's vote power.
      */
     function createProposal(
-        string memory /*description*/,
-        address target,
-        bytes4 selector,
-        bytes memory args,
+        string memory title,
+        ProposalExecution[] memory executions,
         IndividualRankProof[] memory individualRankProofs,
         ClubRankProof[] memory clubRankProofs
     ) external requiresPower(individualRankProofs, clubRankProofs) {
-        require(target.code.length > 0, "Invalid target contract");
 
-        //Check target address is trusted
-        if (s_config.allowOnlyTrustedTargets) {
-            require(i_token.isTrustedAddress(target), "AllowOnlyTrustedTargets is enabled and target is not in the trusted list.");
-        }
+        //Check execution count
+        require(executions.length > 0, "Proposal must have at least one execution");
+        require(executions.length <= s_config.maxExecutionsPerProposal, "Proposal cannot have that many of executions");
 
-        //Check is function selector restricted
-        bool isRestricted = isRestrictedFunction(selector);
-        if (isRestricted && msg.sender != i_interimOwner) {
-            revert("Only interim owner can create proposal with this restricted function call");
+        //Check executions
+        bool hasRestrictedFunctions = false;
+        for (uint256 i = 0; i < executions.length; i++) {
+            ProposalExecution memory execution = executions[i];
+
+            //Check target address is trusted
+            if (s_config.allowOnlyTrustedTargets) {
+                require(i_token.isTrustedAddress(execution.target), "AllowOnlyTrustedTargets is enabled and target is not in the trusted list.");
+            }
+
+            //Check is the function restricted or has a value(sending ETH)
+            bool isRestricted = isRestrictedFunction(execution.selector);
+            if ((isRestricted || execution.value > 0) && msg.sender != i_interimOwner) {
+                revert("Only interim owner can create this proposal because target function is restricted or proposal has value");
+            } else if (isRestricted) {
+                hasRestrictedFunctions = true;
+            }
         }
 
         //Check is user banned
@@ -232,41 +270,47 @@ contract BSGovernor is ReentrancyGuard {
         //Check proposal count of sender (max 4 proposals in a week)
         _checkProposalCount(msg.sender);
 
+        //Check title
+        require(bytes(title).length <= 128, "Proposal title is too long, max 128 bytes allowed");
+
         // Proposal Data
         uint64 proposalId = uint64(s_proposals.length);
-        uint64 maxWeekIndex = uint64(i_rewarder.getWeekId());
+        uint64 maxWeekIndex = uint64(i_rewarder.getWeekId()); //Latest week (current week)
         uint64 minWeekIndex = calculateMinimumWeekIndex(maxWeekIndex);
         uint64 quorumThreshold = calculateQuorumThreshold(minWeekIndex, maxWeekIndex);
 
-        bytes32 proposalHash = _calculateProposalHash(target, selector, args);
+        bytes32 proposalHash = _calculateProposalHash(executions);
         require(!s_weeklyProposalHashs[maxWeekIndex][proposalHash], "Proposal with the same content is already created in this week");
 
-        Proposal memory proposal;
+        // Proposal Data
+        s_proposals.push();
+
+        Proposal storage proposal = s_proposals[proposalId];
         proposal.id = proposalId;
+        proposal.title = title;
         proposal.startTime = block.timestamp;
         proposal.endTime = proposal.startTime + s_config.votingDuration;
         proposal.maxWeekIndex = maxWeekIndex;
         proposal.minWeekIndex = minWeekIndex;
         proposal.quorumThreshold = quorumThreshold;
         proposal.approvalThresholdPercent = s_config.approvalThresholdPercent;
-        proposal.active = true;
+        proposal.ended = false;
         proposal.proposer = msg.sender;
-        proposal.target = target;
-        proposal.selector = selector;
-        proposal.args = args;
-        
-        s_proposals.push(proposal);
+
+        // Copy executions from memory to storage
+        _addExecutions(proposalId, executions);
+
+        s_userProposals[msg.sender].push(proposalId);
         s_weeklyProposalHashs[maxWeekIndex][proposalHash] = true;
-        emit ProposalCreated(proposalId);
+        emit ProposalCreated(proposalId, msg.sender);
 
         //If interim governance is enabled, the caller is the interim owner, and the target function is not in the restricted functions;
         //Skip the voting period and approve the proposal.
         //Interim owner will be able to execute this proposal after the time lock has passed (1 day).
-        if (!isRestricted && s_config.interimActive && i_interimOwner == msg.sender) {
+        if (!hasRestrictedFunctions && s_config.interimActive && i_interimOwner == msg.sender) {
             //Approve the proposal
-            Proposal storage _proposal = s_proposals[proposalId];
-            _proposal.endTime = block.timestamp; //Skip the voting period
-            _approveProposal(_proposal);
+            proposal.endTime = block.timestamp; //Skip the voting period
+            _approveProposal(proposal);
         }
     }
 
@@ -297,11 +341,12 @@ contract BSGovernor is ReentrancyGuard {
         require(power > 0, "You don't have enough power to vote on this proposal.");
 
         //Check is proposal still active
-        require(proposal.active && proposal.outcome == ProposalOutcome.PENDING, "Proposal is not active");
+        require(!proposal.ended && proposal.outcome == ProposalOutcome.PENDING, "Proposal is ended");
         require(block.timestamp < proposal.endTime, "Proposal voting period has passed");
 
         UserVote memory userVote;
         userVote.power = power;
+        proposal.totalVoters += 1;
 
         if (decision) {
             proposal.yesVotes += power;
@@ -330,7 +375,7 @@ contract BSGovernor is ReentrancyGuard {
         Proposal storage proposal = s_proposals[proposalId];
 
         //Check voting period
-        require(proposal.active && proposal.outcome == ProposalOutcome.PENDING, "Proposal already finalized");
+        require(!proposal.ended && proposal.outcome == ProposalOutcome.PENDING, "Proposal is ended");
         require(block.timestamp >= proposal.endTime, "Proposal voting period is still ongoing");
 
         //Calculate decision
@@ -368,12 +413,15 @@ contract BSGovernor is ReentrancyGuard {
         Proposal storage proposal = s_proposals[proposalId];
 
         //Proposal should be active and approved
-        require(proposal.active && proposal.outcome == ProposalOutcome.APPROVED, "Proposal is not approved yet");
+        require(!proposal.ended && proposal.outcome == ProposalOutcome.APPROVED, "Proposal is not approved yet");
 
-        //Check is the function restricted
-        bool isRestricted = isRestrictedFunction(proposal.selector);
-        if (isRestricted && msg.sender != i_interimOwner) {
-            revert("Only interim owner can execute this proposal because target function is restricted");
+        //Check is the function restricted or has a value(sending ETH)
+        for (uint256 i = 0; i < proposal.executions.length; i++) {
+            ProposalExecution memory execution = proposal.executions[i];
+            bool isRestricted = isRestrictedFunction(execution.selector);
+            if ((execution.value > 0 || isRestricted) && msg.sender != i_interimOwner) {
+                revert("Only interim owner can execute this proposal because target function is restricted, or proposal has value");
+            }
         }
 
         //Check TimeLock
@@ -395,10 +443,10 @@ contract BSGovernor is ReentrancyGuard {
     /**
      * @notice Updates DAO governance parameters
      * @dev Only callable by the DAO.
-     * @param newValue New quorum threshold percentage (20-60)
+     * @param newValue New quorum threshold percentage (5-60)
      */
     function setQuorumThresholdPercent(uint16 newValue) external onlyDAO {
-        require(newValue >= 20 && newValue <= 60, "Quorum threshold must be between 20 and 60");
+        require(newValue >= 5 && newValue <= 60, "Quorum threshold must be between 5 and 60");
 
         emit QuorumThresholdPercentUpdated(s_config.quorumThresholdPercent, newValue);
         s_config.quorumThresholdPercent = newValue;
@@ -489,6 +537,13 @@ contract BSGovernor is ReentrancyGuard {
         emit RestrictedFunctionSet(selector, isRestricted);
     }
 
+    function setMaxExecutionsPerProposal(uint16 newValue) external onlyDAO {
+        require(newValue >= 1 && newValue <= 10, "Max executions per proposal must be between 1 and 10");
+
+        emit MaxExecutionsPerProposalUpdated(s_config.maxExecutionsPerProposal, newValue);
+        s_config.maxExecutionsPerProposal = newValue;
+    }
+
     /**
      * @notice Reactivates interim governance after 2 months of inactivity
      * @dev Can only be called by interim owner when no proposals executed for 60 days
@@ -526,7 +581,7 @@ contract BSGovernor is ReentrancyGuard {
         Proposal storage proposal,
         ProposalOutcome outcome
     ) internal {
-        proposal.active = false;
+        proposal.ended = true;
         proposal.outcome = outcome;
         emit ProposalFinalized(proposal.id, outcome);
     }
@@ -539,16 +594,18 @@ contract BSGovernor is ReentrancyGuard {
     function _expireProposal(
         Proposal storage proposal
     ) internal {
-        proposal.active = false;
-        proposal.result.status = ProposalExecutionStatus.EXPIRED;
+        proposal.ended = true;
+        for (uint256 i = 0; i < proposal.executions.length; i++) {
+            proposal.results[i].status = ProposalExecutionStatus.EXPIRED;
+        }
 
-        emit ProposalExecuted(proposal.id, ProposalExecutionStatus.EXPIRED, "");
+        emit ProposalExpired(proposal.id, proposal.title);
     }
 
     /**
      * @dev Executes a proposal by calling the target contract with the provided function selector and arguments.
      * Sets the proposal as inactive and updates the proposal outcome based on the results of the call.
-     * Emits a `ProposalFinalized` event with the proposal ID and outcome.
+     * Emits a {ProposalFinalized} event with the proposal ID and outcome.
      * 
      * @param proposal The proposal to be executed.
      */
@@ -556,28 +613,35 @@ contract BSGovernor is ReentrancyGuard {
     function _executeProposal(
         Proposal storage proposal
     ) internal {
-        //Set proposal as inactive
-        proposal.active = false;
+        //Set proposal as ended
+        proposal.ended = true;
 
         //Call function
-        bytes memory callData = bytes.concat(
-            proposal.selector,
-            proposal.args
-        );
+        bool allSucceed = true;
+        for (uint256 i = 0; i < proposal.executions.length; i++) {
+            ProposalExecution memory execution = proposal.executions[i];
+            bytes memory callData = bytes.concat(
+                execution.selector,
+                execution.args
+            );
 
-        (bool success, bytes memory resultBytes) = proposal.target.call(callData);
+            (bool success, bytes memory resultBytes) = execution.target.call{value: execution.value}(callData);
+            if (!success) {
+                allSucceed = false;
+            }
+
+            //Set proposal result and outcome
+            ProposalExecutionStatus execStatus = success ? ProposalExecutionStatus.SUCCESS : ProposalExecutionStatus.FAILED;
+            proposal.results[i].callResult = resultBytes;
+            proposal.results[i].status = execStatus;
+        }
 
         //Set last executed proposal
-        if (success) {
+        if (allSucceed) {
             lastSuccessfulExecutionTime = block.timestamp;
         }
 
-        //Set proposal result and outcome
-        ProposalExecutionStatus execStatus = success ? ProposalExecutionStatus.SUCCESS : ProposalExecutionStatus.FAILED;
-        proposal.result.callResult = resultBytes;
-        proposal.result.status = execStatus;
-
-        emit ProposalExecuted(proposal.id, execStatus, resultBytes);
+        emit ProposalExecuted(proposal.id, proposal.title, msg.sender, allSucceed);
     }
 
     /**
@@ -595,6 +659,32 @@ contract BSGovernor is ReentrancyGuard {
         }
         
         s_weeklyProposalCounter[currentWeekId][user] += 1;
+    }
+
+    /**
+     * @dev Adds executions to a proposal.
+     * @param proposalId The ID of the proposal to which the executions are being added.
+     * @param executions An array of ProposalExecution structs containing the details of each execution.
+     */
+    function _addExecutions(uint256 proposalId, ProposalExecution[] memory executions) internal {
+        Proposal storage storedProposal = s_proposals[proposalId];
+        for (uint256 i = 0; i < executions.length; i++) {
+            storedProposal.executions.push(
+                ProposalExecution({
+                    target: executions[i].target,
+                    selector: executions[i].selector,
+                    args: executions[i].args,
+                    value: executions[i].value
+                })
+            );
+
+            storedProposal.results.push(
+                ProposalResult({
+                    callResult: "0x0",
+                    status: ProposalExecutionStatus.NOT_EXECUTED
+                })
+            );
+        }
     }
 
     /**
@@ -640,6 +730,7 @@ contract BSGovernor is ReentrancyGuard {
      */
     function calculateQuorumThreshold(uint256 minWeekIndex, uint64 maxWeekIndex) public view returns(uint64) {
         uint256 totalVoteEntries = calculateMaximumVotes(minWeekIndex, maxWeekIndex);
+        require(totalVoteEntries > 0, "There is not enough entries to calculate quorum threshold for the proposal");
 
         uint64 quorumThreshold = uint64((totalVoteEntries * s_config.quorumThresholdPercent) / 100);
         return quorumThreshold;//quorumThreshold > 0 ? quorumThreshold : 1;
@@ -725,6 +816,11 @@ contract BSGovernor is ReentrancyGuard {
         return s_proposals.length;
     }
 
+    /**
+     * @notice Retrieves a proposal by ID.
+     * @param proposalId The ID of the proposal to get.
+     * @return Proposal struct containing all details of the proposal.
+     */
     function getProposal(uint64 proposalId) requiresProposal(proposalId) external view returns(Proposal memory) {
         return s_proposals[proposalId];
     }
@@ -747,6 +843,15 @@ contract BSGovernor is ReentrancyGuard {
         return s_userVotesByProposal[proposalId][user].decision == ProposalDecision.NOT_VOTED ? false : true;
     }
 
+    function isProposalEnded(uint64 proposalId) external view returns(bool) {
+        return s_proposals[proposalId].ended;
+    }
+
+    function isProposalVotingOngoing(uint64 proposalId) external view returns(bool) {
+        Proposal storage proposal = s_proposals[proposalId];
+        return (proposal.outcome == ProposalOutcome.PENDING && !proposal.ended && block.timestamp < proposal.endTime);
+    }
+
     function getMaximumVotes(uint64 proposalId) requiresProposal(proposalId) external view returns(uint64) {
         return calculateMaximumVotes(s_proposals[proposalId].minWeekIndex, s_proposals[proposalId].maxWeekIndex);
     }
@@ -757,6 +862,28 @@ contract BSGovernor is ReentrancyGuard {
      */
     function getDAOConfig() external view returns (DAOConfig memory) {
         return s_config;
+    }
+
+    /**
+     * @notice Returns the number of active proposals.
+     */
+    function getActiveProposalCount() external view returns(uint256 activeProposalCount) {
+        uint256 count = 0;
+        for (uint256 i = 0; i < s_proposals.length; i++) {
+            if (!s_proposals[i].ended) {
+                count++;
+            }
+        }
+        return count;
+    }
+
+    /**
+     * @notice Returns the list of proposal IDs created by a user
+     * @param user Address of the user to check
+     * @return Array of proposal IDs created by the user
+     */
+    function getUserProposals(address user) external view returns(uint64[] memory) {
+        return s_userProposals[user];
     }
 
     /**
@@ -832,19 +959,19 @@ contract BSGovernor is ReentrancyGuard {
     }
 
     /**
-     * @notice Encodes a proposal data into a bytes32 hash.
-     * @dev Uses keccak256 to hash the concatenated proposal data.
-     * @param target The address of the target contract.
-     * @param selector The function selector to be called on the target contract.
-     * @param args The arguments to be passed to the function call on the target contract.
-     * @return bytes32 The resulting hash of the encoded snapshot.
+     * @notice Encodes all proposal executions into a single bytes32 hash.
+     * @dev Hashes the concatenated target, selector, args, and value of each execution.
+     * @param executions An array of ProposalExecution structs containing the details of each execution.
+     * @return bytes32 The resulting hash of the encoded executions.
      */
     function _calculateProposalHash(
-        address target,
-        bytes4 selector,
-        bytes memory args
+        ProposalExecution[] memory executions
     ) internal pure returns (bytes32) {
-        return keccak256(abi.encode(target, selector, args));
+        bytes memory allData;
+        for (uint256 i = 0; i < executions.length; i++) {
+            allData = bytes.concat(allData, abi.encode(executions[i]));
+        }
+        return keccak256(allData);
     }
 
     function _isIndividualRankProofEqual(IndividualRankProof memory a, IndividualRankProof memory b) internal pure returns (bool) {
@@ -854,4 +981,6 @@ contract BSGovernor is ReentrancyGuard {
     function _isClubRankProofEqual(ClubRankProof memory a, ClubRankProof memory b) internal pure returns (bool) {
         return (a.weekIndex == b.weekIndex && a.clubRank == b.clubRank && a.memberRank == b.memberRank);
     }
+
+    receive() external payable { }
 }
